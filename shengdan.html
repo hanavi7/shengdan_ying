@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>AI手势交互：3D光影圣诞树</title>
+    <style>
+        body { margin: 0; overflow: hidden; background: #050505; font-family: 'Segoe UI', sans-serif; }
+        #container { width: 100vw; height: 100vh; }
+        #ui-overlay {
+            position: absolute; top: 20px; left: 20px; color: gold;
+            text-shadow: 0 0 10px rgba(255, 215, 0, 0.5); pointer-events: none;
+        }
+        #upload-btn {
+            position: absolute; bottom: 30px; right: 30px;
+            background: linear-gradient(45deg, #d4af37, #8b0000);
+            color: white; border: none; padding: 12px 24px; border-radius: 30px;
+            cursor: pointer; font-weight: bold; pointer-events: auto;
+        }
+        canvas#video-canvas {
+            position: absolute; top: 10px; right: 10px; width: 160px; height: 120px;
+            border-radius: 8px; border: 1px solid rgba(255,255,255,0.2); transform: scaleX(-1);
+        }
+        .loading {
+            position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
+            color: white; text-align: center;
+        }
+    </style>
+</head>
+<body>
+
+<div id="ui-overlay">
+    <h2>高级手势圣诞树 2024</h2>
+    <p>握拳: 合拢 | 张手: 散开 | 捏合: 缩放照片</p>
+</div>
+
+<input type="file" id="image-upload" multiple accept="image/*" style="display: none;">
+<button id="upload-btn">上传照片云</button>
+
+<div id="container"></div>
+<canvas id="video-canvas"></canvas>
+
+<script type="importmap">
+{
+    "imports": {
+        "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+    }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { Tween } from 'https://unpkg.com/@tweenjs/tween.js@23.1.1/dist/tween.esm.js';
+
+// --- MediaPipe 配置 ---
+import { HandLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0";
+
+let handLandmarker;
+let video;
+const videoCanvas = document.getElementById('video-canvas');
+const vctx = videoCanvas.getContext('2d');
+
+// --- 核心变量 ---
+let scene, camera, renderer, composer, controls;
+const count = 600; // 粒子总数
+const photoCount = 20; // 照片数量
+let instances = []; // 存储所有实例的信息
+let instMesh; // 统一渲染实例
+let photoMeshes = []; // 存储照片平面
+
+const STATE = { COLLAPSE: 0, SCATTER: 1, ZOOM: 2 };
+let currentState = STATE.COLLAPSE;
+let targetRotation = { x: 0, y: 0 };
+
+// --- 初始化场景 ---
+async function init() {
+    scene = new THREE.Scene();
+    scene.fog = new THREE.FogExp2(0x050505, 0.002);
+
+    camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+    camera.position.z = 15;
+
+    renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    renderer.setPixelRatio(window.devicePixelRatio);
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.toneMapping = THREE.ReinhardToneMapping;
+    document.getElementById('container').appendChild(renderer.domElement);
+
+    // 后期处理：辉光
+    const renderScene = new RenderPass(scene, camera);
+    const bloomPass = new UnrealBloomPass(new THREE.Vector2(window.innerWidth, window.innerHeight), 1.5, 0.4, 0.85);
+    bloomPass.threshold = 0.2;
+    bloomPass.strength = 1.2;
+    composer = new EffectComposer(renderer);
+    composer.addPass(renderScene);
+    composer.addPass(bloomPass);
+
+    // 灯光
+    const ambientLight = new THREE.AmbientLight(0x404040, 2);
+    scene.add(ambientLight);
+    const pointLight = new THREE.PointLight(0xff0000, 5, 50);
+    pointLight.position.set(5, 5, 5);
+    scene.add(pointLight);
+
+    initParticles();
+    initHandTracking();
+    animate();
+}
+
+// --- 初始化粒子和圣诞树逻辑 ---
+function initParticles() {
+    const geometries = [
+        new THREE.SphereGeometry(0.1, 8, 8),
+        new THREE.BoxGeometry(0.15, 0.15, 0.15),
+        new THREE.CylinderGeometry(0.05, 0.05, 0.3) // 简化糖果棍
+    ];
+
+    const material = new THREE.MeshStandardMaterial({
+        metalness: 0.9,
+        roughness: 0.1,
+        vertexColors: true
+    });
+
+    instMesh = new THREE.InstancedMesh(geometries[0], material, count);
+    
+    const color = new THREE.Color();
+    for (let i = 0; i < count; i++) {
+        // 初始位置：圣诞树圆锥
+        const h = Math.random() * 10;
+        const r = (10 - h) * 0.4;
+        const theta = Math.random() * Math.PI * 2;
+        
+        const collapsePos = new THREE.Vector3(
+            Math.cos(theta) * r,
+            h - 5,
+            Math.sin(theta) * r
+        );
+
+        const scatterPos = new THREE.Vector3(
+            (Math.random() - 0.5) * 30,
+            (Math.random() - 0.5) * 20,
+            (Math.random() - 0.5) * 20
+        );
+
+        // 分配颜色：暗绿、金、红
+        const rand = Math.random();
+        if (rand < 0.6) color.setHex(0x1a3300); // 哑光绿
+        else if (rand < 0.9) color.setHex(0xd4af37); // 金属金
+        else color.setHex(0x8b0000); // 圣诞红
+
+        instances.push({
+            collapsePos,
+            scatterPos,
+            currentPos: collapsePos.clone(),
+            color: color.clone(),
+            rot: new THREE.Euler(Math.random(), Math.random(), Math.random())
+        });
+
+        instMesh.setColorAt(i, color);
+    }
+    scene.add(instMesh);
+}
+
+// --- 照片云逻辑 ---
+document.getElementById('upload-btn').onclick = () => document.getElementById('image-upload').click();
+document.getElementById('image-upload').onchange = (e) => {
+    const files = e.target.files;
+    for (let i = 0; i < Math.min(files.length, 10); i++) {
+        const url = URL.createObjectURL(files[i]);
+        new THREE.TextureLoader().load(url, (tex) => {
+            const mat = new THREE.MeshBasicMaterial({ map: tex, side: THREE.DoubleSide });
+            const geo = new THREE.PlaneGeometry(2, 2);
+            const mesh = new THREE.Mesh(geo, mat);
+            mesh.position.set((Math.random()-0.5)*15, (Math.random()-0.5)*10, (Math.random()-0.5)*10);
+            scene.add(mesh);
+            photoMeshes.push(mesh);
+        });
+    }
+};
+
+// --- 手势识别逻辑 ---
+async function initHandTracking() {
+    const vision = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0/wasm");
+    handLandmarker = await HandLandmarker.createFromOptions(vision, {
+        baseOptions: { modelAssetPath: `https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task`, delegate: "GPU" },
+        runningMode: "VIDEO", numHands: 1
+    });
+
+    video = document.createElement('video');
+    const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+    video.srcObject = stream;
+    video.play();
+}
+
+function detectHands() {
+    if (!handLandmarker || video.readyState !== 4) return;
+    
+    const results = handLandmarker.detectForVideo(video, performance.now());
+    if (results.landmarks && results.landmarks.length > 0) {
+        const hand = results.landmarks[0];
+        
+        // 1. 判断握拳 (Fist) - 简易算法：指尖到手掌距离
+        const dist = Math.hypot(hand[8].x - hand[0].x, hand[8].y - hand[0].y);
+        
+        // 2. 交互逻辑
+        if (dist < 0.15) {
+            currentState = STATE.COLLAPSE;
+        } else if (dist > 0.4) {
+            currentState = STATE.SCATTER;
+        }
+
+        // 3. 旋转控制 (根据手心位置)
+        targetRotation.y = (hand[0].x - 0.5) * 2;
+        targetRotation.x = (hand[0].y - 0.5) * 2;
+
+        // 4. 捏合动作 (食指和拇指)
+        const pinchDist = Math.hypot(hand[8].x - hand[4].x, hand[8].y - hand[4].y);
+        if (pinchDist < 0.05 && photoMeshes.length > 0) {
+            currentState = STATE.ZOOM;
+        }
+    }
+}
+
+// --- 动画循环 ---
+function animate() {
+    requestAnimationFrame(animate);
+    detectHands();
+
+    // 平滑过渡粒子位置
+    const dummy = new THREE.Object3D();
+    instances.forEach((inst, i) => {
+        const target = (currentState === STATE.COLLAPSE) ? inst.collapsePos : inst.scatterPos;
+        inst.currentPos.lerp(target, 0.05);
+        
+        dummy.position.copy(inst.currentPos);
+        dummy.rotation.copy(inst.rot);
+        dummy.updateMatrix();
+        instMesh.setMatrixAt(i, dummy.matrix);
+    });
+    instMesh.instanceMatrix.needsUpdate = true;
+
+    // 旋转相机
+    scene.rotation.y += (targetRotation.y - scene.rotation.y) * 0.05;
+    scene.rotation.x += (targetRotation.x - scene.rotation.x) * 0.05;
+
+    // 照片动画
+    photoMeshes.forEach((mesh, i) => {
+        if (currentState === STATE.ZOOM) {
+            mesh.scale.lerp(new THREE.Vector3(2, 2, 2), 0.1);
+            mesh.position.lerp(new THREE.Vector3(0, 0, 5), 0.05);
+        } else {
+            mesh.scale.lerp(new THREE.Vector3(1, 1, 1), 0.1);
+            // 漂浮感
+            mesh.position.y += Math.sin(Date.now() * 0.001 + i) * 0.005;
+        }
+    });
+
+    composer.render();
+}
+
+window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    composer.setSize(window.innerWidth, window.innerHeight);
+});
+
+init();
+
+</script>
+</body>
+</html>
